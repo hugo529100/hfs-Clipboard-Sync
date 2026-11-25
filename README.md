@@ -1,3 +1,11 @@
+
+
+https://github.com/user-attachments/assets/21ca1877-1fbd-406a-882a-ff3f3e37908b
+
+
+
+
+
 # Clipboard-Sync (HFS 3 cross-device clipboard)
 
 Share the HFS cut/paste clipboard between every browser and device logged into the **same HFS account**: cut a file on device A, and the native `#clipBar` on device B immediately shows the same clipboard. Pressing **Paste** on B makes the server move the files into B's current folder.
