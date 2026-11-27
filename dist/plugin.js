@@ -1,34 +1,7 @@
 'use strict'
 
- 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-exports.version = 2.0
-exports.description = "Cross-device clipboard sync for HFS 3. Share cut/paste between browsers and devices logged into the same account. Server-side paste claiming prevents duplicates; pages on affected addresses update lists in place. Guests are rejected."
+exports.version = 2.4
+exports.description = "Cross-device clipboard sync for HFS 3. Share cut and copy clipboards between browsers and devices logged into the same account. Server-side paste claiming prevents duplicate moves; pages on affected addresses update lists in place. Guests are rejected. Copy clipboards are synced only while copy-files is running, and large cross-disk pastes are handed to SafeMove (or the older FastMove) for a resumable, throttled, hash-verified queue."
 exports.apiRequired = 12.0
 exports.repo = "hugo529100/hfs-Clipboard-Sync"
 exports.frontend_js = "main.js"
@@ -68,6 +41,20 @@ exports.init = async api => {
     const { getCurrentUsername } = api.require('./auth')
     const { moveFiles } = api.require('./frontEndApis')
 
+    // Copy clipboards are only synced when the stock copy-files plugin is
+    // running: its frontend is what actually executes a copy paste. Without
+    // it, a synced copy clipboard could fall through to the native move.
+    let copyFilesRunning = () => false
+    try {
+        const plugins = api.require('./plugins')
+        if (typeof plugins.isPluginRunning === 'function')
+            copyFilesRunning = () => {
+                try { return Boolean(plugins.isPluginRunning('copy-files')) }
+                catch { return false }
+            }
+    }
+    catch {}
+
     const db = await api.openDb('clipboard', { rewriteLater: true })
 
     const CHANNEL_PREFIX = 'clipSync_'
@@ -98,6 +85,39 @@ exports.init = async api => {
     function log(...args) {
         if (api.getConfig('debug'))
             api.log('[Clipboard-Sync]', ...args)
+    }
+
+    // SafeMove (and older FastMove) expose a backend customApi for moving.
+    // Only one of them should be installed, but try both names so either era
+    // keeps working. An empty array means no plugin provides this name, which
+    // is different from a plugin answering "this move needs no fast path".
+    async function tryMoveApi(method, uris, to, ctx) {
+        const calls = api.customApiCall(method, uris, to, ctx)
+        if (!calls || !calls.length)
+            return { present: false }
+        const results = await Promise.all(calls)
+        const handled = results.find(result => result && Array.isArray(result.errors))
+        return { present: true, handled }
+    }
+
+    async function performMove(uris, to, ctx) {
+        for (const method of ['safemove_move', 'fastmove_move']) {
+            try {
+                const res = await tryMoveApi(method, uris, to, ctx)
+                if (res.handled) {
+                    log('move delegated to', method, uris.length, 'items')
+                    return res.handled
+                }
+                if (res.present) {
+                    log(method, 'present but no fast path; native move')
+                    return moveFiles(uris, to, ctx)
+                }
+            }
+            catch (e) {
+                log(method, 'call failed, trying next/native', e)
+            }
+        }
+        return moveFiles(uris, to, ctx)
     }
 
     function text(value, maxLen) {
@@ -157,10 +177,10 @@ exports.init = async api => {
         if (!raw || typeof raw !== 'object') return state
         if (Number.isFinite(raw.version)) state.version = Math.max(0, Math.floor(raw.version))
         if (Number.isFinite(raw.at)) state.at = Math.max(0, Math.floor(raw.at))
-        if (raw.kind === 'cut') {
+        if (raw.kind === 'cut' || raw.kind === 'copy') {
             const items = cleanItems(raw.items)
             if (items.length) {
-                state.kind = 'cut'
+                state.kind = raw.kind
                 state.items = items
                 if (raw.owner) state.owner = cleanClient(raw.owner)
             }
@@ -208,6 +228,7 @@ exports.init = async api => {
             kind: state.kind,
             items: state.items,
             owner: state.owner,
+            copySupported: copyFilesRunning(),
             pasting: state.pasting
                 ? { id: state.pasting.id, label: state.pasting.label, at: state.pasting.at }
                 : null,
@@ -500,14 +521,17 @@ exports.init = async api => {
 
             let kind = params?.kind === 'clear' ? 'clear'
                 : params?.kind === 'cut' ? 'cut'
-                    : null
+                    : params?.kind === 'copy' ? 'copy'
+                        : null
             if (!kind) return { ok: false, reason: 'bad' }
+            if (kind === 'copy' && !copyFilesRunning())
+                return { ok: false, reason: 'copy-unsupported', snapshot: publicState(state) }
 
             
             if (state.pasting)
                 return { ok: false, reason: 'busy', snapshot: publicState(state) }
 
-            if (kind === 'cut') {
+            if (kind === 'cut' || kind === 'copy') {
                 const items = cleanItems(params.items)
                 if (!items.length) kind = 'clear'
                 else {
@@ -515,7 +539,7 @@ exports.init = async api => {
                     
                     if (Number.isFinite(clientAt) && clientAt < state.at - CLIENT_AT_TOLERANCE)
                         return { ok: false, reason: 'stale', snapshot: publicState(state) }
-                    state.kind = 'cut'
+                    state.kind = kind
                     state.items = items
                     state.owner = cleanClient(params.client)
                 }
@@ -557,6 +581,11 @@ exports.init = async api => {
 
             expirePasting(state)
 
+            // copy-files performs the actual copy paste in the frontend. Never
+            // let a copy clipboard fall through to the move path here.
+            if (state.kind === 'copy')
+                return { ok: false, reason: 'copy', snapshot: publicState(state) }
+
             if (state.kind !== 'cut' || !state.items.length)
                 return { ok: false, reason: 'empty', snapshot: publicState(state) }
 
@@ -580,10 +609,10 @@ exports.init = async api => {
             activeClaims.add(opId)
             let result
             try {
-                result = await moveFiles(claimed.map(item => item.uri), to, ctx)
+                result = await performMove(claimed.map(item => item.uri), to, ctx)
             }
             catch (e) {
-                log('moveFiles threw', e)
+                log('move threw', e)
                 result = { errors: claimed.map(() => e?.code || e?.message || 'error') }
             }
             finally {

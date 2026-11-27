@@ -42,7 +42,7 @@
     let pendingShowEvents = []
     let opChain = Promise.resolve()
     let pending = null             
-    let pendingClear = false
+    let pendingClear = null        // 'cut' | 'copy' | null
     let lastPublishedSig = ''
     let lastToastVersion = -1
     let retryCount = 0
@@ -189,6 +189,7 @@
             owner: null,
             items: [],
             pasting: null,
+            copySupported: false,
             ready: false,
             connecting: false,
             skew: 0,
@@ -545,6 +546,8 @@
             clearTimeout(session.connectTimer)
         }
         clearTimeout(publishTimer)
+        clearInterval(copyClearTimer)
+        copyClearTimer = 0
         clearTimeout(retryTimer)
         clearTimeout(refreshTimer)
         clearTimeout(presenceTimer)
@@ -554,7 +557,7 @@
         pendingShowEvents = []
         session = null
         pending = null
-        pendingClear = false
+        pendingClear = null
         lastPublishedSig = ''
         lastToastVersion = -1
         retryCount = 0
@@ -588,6 +591,7 @@
         s.at = Number(snapshot.at) || 0
         s.kind = snapshot.kind || null
         s.owner = snapshot.owner || null
+        s.copySupported = Boolean(snapshot.copySupported)
         s.pasting = snapshot.pasting || null
         s.items = Array.isArray(snapshot.items) ? snapshot.items : []
         if (pending && (snapshot.lastOp === pending.opId || version > pending.versionAtChange))
@@ -600,16 +604,26 @@
         const s = session
         if (!s) return
         const clip = HFS.state.clip
-        
-        if (clip?.__copy) return
-
         const items = Array.isArray(snapshot.items) ? snapshot.items : []
-        if (snapshot.kind === 'cut' && items.length) {
+        const copy = snapshot.kind === 'copy'
+
+        if ((snapshot.kind === 'cut' || copy) && items.length) {
+            if (copy && !s.copySupported) return
+            // Our own copy publish can return after copy-files already cleared
+            // the local clipboard. Do not resurrect it: clear the server side.
+            if (copy && !clip?.length && snapshot.owner?.id === CLIENT_ID) {
+                pendingClear = 'copy'
+                remoteClip = null
+                clearTimeout(publishTimer)
+                publishTimer = setTimeout(flushLocal, 10)
+                return
+            }
             const sig = itemsSignature(items)
             const currentSig = clipSignature(clip)
-            if (sig !== currentSig) {
+            if (sig !== currentSig || Boolean(clip?.__copy) !== copy) {
                 const entries = items.map(toEntry).filter(Boolean)
                 if (!entries.length) return
+                if (copy) entries.__copy = true
                 applying = true
                 try { HFS.state.clip = entries }
                 finally { applying = false }
@@ -622,9 +636,10 @@
             if (snapshot.owner?.id !== CLIENT_ID && snapshot.version > lastToastVersion) {
                 lastToastVersion = snapshot.version
                 const who = snapshot.owner?.label || ''
+                const label = copy ? 'Synced copy clipboard' : 'Synced clipboard'
                 const msg = who
-                    ? `Synced clipboard: ${itemsLabel(items.length)} from ${who}`
-                    : `Synced clipboard: ${itemsLabel(items.length)}`
+                    ? `${label}: ${itemsLabel(items.length)} from ${who}`
+                    : `${label}: ${itemsLabel(items.length)}`
                 notify(msg, 'info')
             }
         }
@@ -648,29 +663,53 @@
         const prev = clipInfo
         noteClip(clip)
 
-        if (!clip?.length && prev.active && !prev.copy) {
-            pendingClear = true
+        if (!clip?.length && prev.active) {
+            pendingClear = prev.copy ? 'copy' : 'cut'
         }
         else if (clip?.length) {
-            pendingClear = false
+            pendingClear = null
         }
 
         clearTimeout(publishTimer)
+        clearInterval(copyClearTimer)
+        copyClearTimer = 0
         publishTimer = setTimeout(flushLocal, 120)
+    }
+
+    // copy-files clears the clipboard with `clip.length = 0`, which is an
+    // in-place mutation and may not fire watchState. Watch the exact array that
+    // was pasted until it empties or is replaced, then publish the clear.
+    let copyClearTimer = 0
+    function watchCopyClear(clip) {
+        clearInterval(copyClearTimer)
+        const started = Date.now()
+        copyClearTimer = setInterval(() => {
+            if (!session || HFS.state.clip !== clip || !clip?.__copy
+                || !clip.length || Date.now() - started > 30 * 60_000) {
+                clearInterval(copyClearTimer)
+                copyClearTimer = 0
+                if (session && HFS.state.clip === clip && clip && !clip.length)
+                    onClipChange(clip)
+            }
+        }, 500)
     }
 
     function flushLocal() {
         const s = session
         if (!s?.ready) return
         const clip = HFS.state.clip
-        if (clip?.__copy) return
-        if (remoteClip && clip === remoteClip) return 
+        const copy = Boolean(clip?.__copy)
+        if (copy && !s.copySupported) return
+        // An empty array can still be the same object that was synced (copy-files
+        // clears it in place), so only suppress the echo while it has content.
+        if (remoteClip && clip === remoteClip && clip?.length) return 
 
         if (!clip?.length) {
             if (!pendingClear) return
-            pendingClear = false
-            if (s.kind !== 'cut') return
-            enqueue(() => doPublish(s, { kind: 'clear', baseVersion: s.version }))
+            const clearKind = pendingClear
+            pendingClear = null
+            if (s.kind !== clearKind) return
+            enqueue(() => doPublish(s, { kind: 'clear', baseVersion: s.version }, clearKind))
             return
         }
 
@@ -684,9 +723,10 @@
             })
         }
         if (!items.length) return
-        const sig = itemsSignature(items)
-        if (sig === lastPublishedSig) return
-        enqueue(() => doPublish(s, { kind: 'cut', items }))
+        const kind = copy ? 'copy' : 'cut'
+        const fullSig = kind + ':' + itemsSignature(items)
+        if (fullSig === lastPublishedSig) return
+        enqueue(() => doPublish(s, { kind, items }))
     }
 
     function enqueue(task) {
@@ -694,10 +734,12 @@
         return opChain
     }
 
-    async function doPublish(s, body) {
+    async function doPublish(s, body, clearIntent) {
         if (session !== s || !s.ready) return
-        const sig = body.kind === 'cut' ? itemsSignature(body.items) : ''
-        if (body.kind === 'cut' && sig === lastPublishedSig) return
+        const itemKind = body.kind === 'cut' || body.kind === 'copy'
+        const sig = itemKind ? itemsSignature(body.items) : ''
+        const fullSig = itemKind ? body.kind + ':' + sig : ''
+        if (itemKind && fullSig === lastPublishedSig) return
 
         const opId = newOpId()
         pending = { opId, versionAtChange: s.version }
@@ -713,7 +755,7 @@
         }
         catch (e) {
             pending = null
-            if (body.kind === 'clear') pendingClear = true
+            if (body.kind === 'clear') pendingClear = clearIntent || 'cut'
             log('publish failed', e)
             return schedulePublishRetry()
         }
@@ -722,19 +764,24 @@
         if (res?.ok) {
             pending = null
             retryCount = 0
-            if (body.kind === 'cut') lastPublishedSig = sig
+            if (itemKind) lastPublishedSig = fullSig
             if (res.snapshot) onSnapshot(res.snapshot)
             return
         }
         pending = null
+        if (res?.reason === 'copy-unsupported') {
+            s.copySupported = false
+            notify('Copy clipboard sync needs the copy-files plugin. Local copy kept only.', 'warning')
+            return
+        }
         if (res?.reason === 'busy') {
             
-            if (body.kind === 'clear') pendingClear = true
+            if (body.kind === 'clear') pendingClear = clearIntent || 'cut'
             return schedulePublishRetry(1200)
         }
         if (res?.reason === 'stale') {
             if (res.snapshot) onSnapshot(res.snapshot, { force: true })
-            notify('Clipboard was updated by another device. Latest state loaded; cut again if needed.', 'warning')
+            notify('Clipboard was updated by another device. Latest state loaded; try again if needed.', 'warning')
             return
         }
         if (res?.reason === 'auth') {
@@ -761,7 +808,10 @@
         const to = params?.to
         if (!session?.ready || !to) return
         if (!Array.isArray(from) || !from.length) return
-        if (from.__copy) return 
+        if (from.__copy) {
+            if (session?.copySupported) watchCopyClear(from)
+            return
+        }
         extra.preventDefault()
         const list = Array.from(from)
         enqueue(() => doPaste(list, to))
