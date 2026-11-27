@@ -1,6 +1,6 @@
 'use strict'
 
-exports.version = 2.4
+exports.version = 2.5
 exports.description = "Cross-device clipboard sync for HFS 3. Share cut and copy clipboards between browsers and devices logged into the same account. Server-side paste claiming prevents duplicate moves; pages on affected addresses update lists in place. Guests are rejected. Copy clipboards are synced only while copy-files is running, and large cross-disk pastes are handed to SafeMove (or the older FastMove) for a resumable, throttled, hash-verified queue."
 exports.apiRequired = 12.0
 exports.repo = "hugo529100/hfs-Clipboard-Sync"
@@ -185,8 +185,6 @@ exports.init = async api => {
                 if (raw.owner) state.owner = cleanClient(raw.owner)
             }
         }
-        if (Array.isArray(raw.recent))
-            state.recent = raw.recent.filter(x => typeof x === 'string' && x.length <= 120).slice(0, RECENT_MAX)
         return state
     }
 
@@ -198,25 +196,30 @@ exports.init = async api => {
         catch (e) { log('db.get failed', e) }
         const state = normalizeRecord(raw)
         state.username = username
+        if (raw && !state.items.length) {
+            try { await db.del(username) }
+            catch (e) { log('db.del failed', e) }
+        }
         cache.set(username, state)
         return state
     }
 
     function persist(username, state) {
-        const record = {
-            version: state.version,
-            at: state.at,
-            kind: state.kind,
-            items: state.items,
-            owner: state.owner,
-            recent: state.recent,
-        }
         try {
-            const result = db.put(username, record)
+            const active = state.kind && state.items.length
+            const result = active
+                ? db.put(username, {
+                    version: state.version,
+                    at: state.at,
+                    kind: state.kind,
+                    items: state.items,
+                    owner: state.owner,
+                })
+                : db.del(username)
             if (result && typeof result.catch === 'function')
-                result.catch(e => log('db.put failed', e))
+                result.catch(e => log('db write failed', e))
         }
-        catch (e) { log('db.put failed', e) }
+        catch (e) { log('db write failed', e) }
     }
 
     function publicState(state) {
