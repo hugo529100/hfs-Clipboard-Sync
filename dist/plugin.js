@@ -1,5 +1,33 @@
 'use strict'
-exports.version = 1.9
+
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+exports.version = 2.0
 exports.description = "Cross-device clipboard sync for HFS 3. Share cut/paste between browsers and devices logged into the same account. Server-side paste claiming prevents duplicates; pages on affected addresses update lists in place. Guests are rejected."
 exports.apiRequired = 12.0
 exports.repo = "hugo529100/hfs-Clipboard-Sync"

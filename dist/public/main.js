@@ -872,12 +872,11 @@
     
     document.addEventListener('visibilitychange', () => {
         if (!document.hidden) {
-            refresh(true)
+            if (!session?.es || session.es.readyState !== 1) refresh(true)
             pingPresence(session)
-            if (SYNC_LIST) scheduleListReload() 
         }
         else
-            pingPresence(session) 
+            pingPresence(session)
     })
     window.addEventListener('focus', () => {
         refreshSoon(500)
